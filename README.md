@@ -14,7 +14,7 @@ robot by the runtime in [pollen-robotics/microduck](https://github.com/pollen-ro
 
 https://github.com/user-attachments/assets/50c3d537-8db2-4005-9d9c-3472faeec4d0
 
-The repo encodes the full sim2real recipe: [BAM](https://github.com/Rhoban/bam)
+The repo encodes the full sim2real recipe: [BAM](https://github.com/micro-zoo/bam)
 actuator physics, domain randomization, backlash simulation, and the
 reward-design lessons that made it work
 (see [AGENTS.md](AGENTS.md) for the distilled playbook).
@@ -106,7 +106,7 @@ See `src/mjlab_microduck/tasks/backlash.py`.
 
 ## Actuator model
 
-All tasks use the [BAM](https://github.com/Rhoban/bam) M6 actuator model for
+All tasks use the [BAM](https://github.com/micro-zoo/bam) M6 actuator model for
 the Dynamixel XL330 (voltage control law, back-EMF, Coulomb/Stribeck/load-dependent
 friction), with per-env domain randomization on battery voltage, voltage sag
 under load, command delay, and friction magnitude
@@ -187,7 +187,7 @@ joint-index mappings, reward sign conventions, and NaN guards.
 
 - [microduck](https://github.com/pollen-robotics/microduck) — the Microduck project home, including the onboard runtime that runs the exported policies
 - [mjlab](https://github.com/mujocolab/mjlab) — the training framework (MuJoCo Warp + rsl_rl)
-- [BAM](https://github.com/Rhoban/bam) — better actuator models, by Rhoban
+- [BAM](https://github.com/micro-zoo/bam) — better actuator models, by Rhoban
 
 ## License
 
