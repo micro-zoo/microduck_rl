@@ -63,3 +63,15 @@ def test_acceptance_rejects_grounded_motion_that_removes_the_jump():
 
     assert gates["jump_semantic_coverage"] is False
     assert not all(gates.values())
+
+
+def test_acceptance_rejects_visibly_reduced_kick_and_jump():
+    metrics = _passing_metrics()
+    metrics["kick_amplitude_coverage_ratio"] = 0.74
+    metrics["jump_height_coverage_ratio"] = 0.69
+
+    gates = evaluate_acceptance(metrics)
+
+    assert gates["kick_semantic_coverage"] is False
+    assert gates["jump_semantic_coverage"] is False
+    assert not all(gates.values())

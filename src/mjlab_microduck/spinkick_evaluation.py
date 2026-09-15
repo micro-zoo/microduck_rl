@@ -77,27 +77,29 @@ def evaluate_acceptance(metrics: dict[str, float | int | bool]) -> dict[str, boo
     """Return morphology-tolerant semantic and physical acceptance gates.
 
     UMR maps a human and Microduck with very different proportions and degrees
-    of freedom, so centimetre-level pose matching is diagnostic rather than the
-    objective.  A valid policy must still perform the recognizable whole-body
-    skill: survive the full clip, spin in the reference direction, produce a
-    real single-leg kick, remain broadly close to the retarget, and settle back
-    to the static tail instead of walking away.
+    of freedom, so this is not a literal joint-for-joint replay.  It is still
+    not enough to merely traverse the clip without falling: a valid policy
+    must reproduce most of the turning kick and aerial excursion, track the
+    full body closely, and settle back to the static tail instead of walking
+    away.  These are evaluation gates only; no motion-specific reward is used
+    while training the general tracking pipeline.
     """
 
     gates = {
         "full_horizon_success": float(metrics["success_rate"]) >= 0.95,
-        "action_full_body_position": float(metrics["action_r_mpkpe_m"]) <= 0.10,
-        "action_joint_position": float(metrics["action_joint_pos_mae_rad"]) <= 0.50,
-        "action_body_orientation": float(metrics["action_body_ori_mae_rad"]) <= 1.00,
+        "action_full_body_position": float(metrics["action_r_mpkpe_m"]) <= 0.05,
+        "action_joint_position": float(metrics["action_joint_pos_mae_rad"]) <= 0.30,
+        "action_body_orientation": float(metrics["action_body_ori_mae_rad"])
+        <= 0.40,
         "spin_direction": bool(metrics["spin_direction_matches_reference"]),
         "spin_semantic_coverage": (
             0.70 <= float(metrics["spin_coverage_ratio"]) <= 1.30
         ),
         "kick_semantic_coverage": (
-            float(metrics["kick_amplitude_coverage_ratio"]) >= 0.55
+            float(metrics["kick_amplitude_coverage_ratio"]) >= 0.75
         ),
         "jump_semantic_coverage": (
-            float(metrics["jump_height_coverage_ratio"]) >= 0.50
+            float(metrics["jump_height_coverage_ratio"]) >= 0.70
         ),
         "standing_position": float(metrics["final_joint_pos_mae_rad"]) <= 0.35,
         "standing_speed": float(metrics["final_planar_speed_m_s"]) <= 0.20,
