@@ -7673,3 +7673,595 @@ def dance_beat_sync(
     reward = torch.where(first_step, torch.zeros_like(reward), reward)
     env._dance_beat_sync_prev = potential.detach()
     return reward
+
+# Sprint and fixed-gaze running additions.
+def running_forward_progress_from_velocity(
+    velocity_x: torch.Tensor,
+    speed_cap: float = 1.2,
+) -> torch.Tensor:
+    """Linear forward-speed objective used by the running task.
+
+    Unlike :func:`forward_speed_reward`, this deliberately does not saturate at
+    ordinary walking speed. Backward motion receives no reward and very large
+    velocities are capped so a single physics outlier cannot become a jackpot.
+    """
+    if speed_cap <= 0.0:
+        raise ValueError("speed_cap must be positive")
+    velocity_x = torch.nan_to_num(velocity_x, nan=0.0, posinf=speed_cap, neginf=0.0)
+    return torch.clamp(velocity_x, min=0.0, max=speed_cap) / speed_cap
+
+
+def running_forward_progress(
+    env: ManagerBasedRlEnv,
+    speed_cap: float = 1.2,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Reward forward trunk speed with useful gradient above walking speeds."""
+    asset: Entity = env.scene[asset_cfg.name]
+    return running_forward_progress_from_velocity(
+        asset.data.root_link_lin_vel_b[:, 0], speed_cap=speed_cap
+    )
+
+
+def running_flight_event(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    min_forward_speed: float = 0.3,
+    max_tilt_deg: float = 50.0,
+    min_airborne_steps: int = 3,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Pay once when a stable, forward-moving flight phase begins.
+
+    This is intentionally an event, not an airtime reward: extending an
+    uncontrolled ballistic phase never increases the return. Requiring three
+    consecutive 50 Hz samples rejects one-frame contact-sensor flicker.
+    """
+    if min_airborne_steps < 1:
+        raise ValueError("min_airborne_steps must be at least one")
+    sensor = env.scene[sensor_name]
+    contacts = sensor.data.found.reshape(env.num_envs, -1).any(dim=-1)
+    airborne = ~contacts
+
+    air_steps = getattr(env, "_running_airborne_steps", None)
+    if air_steps is None or air_steps.shape != airborne.shape:
+        air_steps = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+    fresh_episode = env.episode_length_buf == 0
+    air_steps = torch.where(airborne, air_steps + 1, torch.zeros_like(air_steps))
+    air_steps = torch.where(fresh_episode, torch.zeros_like(air_steps), air_steps)
+    onset = air_steps == min_airborne_steps
+    env._running_airborne_steps = air_steps
+
+    asset: Entity = env.scene[asset_cfg.name]
+    forward = torch.nan_to_num(asset.data.root_link_lin_vel_b[:, 0], nan=0.0)
+    gravity_z = torch.nan_to_num(asset.data.projected_gravity_b[:, 2], nan=0.0)
+    max_tilt_cos = math.cos(math.radians(max_tilt_deg))
+    stable = (-gravity_z) >= max_tilt_cos
+    return (onset & stable & (forward >= min_forward_speed)).float()
+
+
+def running_planar_drift_cost_from_values(
+    lateral_velocity: torch.Tensor,
+    yaw_rate: torch.Tensor,
+    lateral_command: torch.Tensor,
+    yaw_command: torch.Tensor,
+    lateral_weight: float = 4.0,
+) -> torch.Tensor:
+    """Positive straight-line error cost; use with a negative reward weight."""
+    lateral_error = torch.nan_to_num(lateral_velocity - lateral_command, nan=0.0)
+    yaw_error = torch.nan_to_num(yaw_rate - yaw_command, nan=0.0)
+    return yaw_error.square() + lateral_weight * lateral_error.square()
+
+
+def running_planar_drift_cost(
+    env: ManagerBasedRlEnv,
+    command_name: str = "twist",
+    lateral_weight: float = 4.0,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Penalize body-frame lateral drift and yaw-rate command error."""
+    asset: Entity = env.scene[asset_cfg.name]
+    command = env.command_manager.get_command(command_name)
+    return running_planar_drift_cost_from_values(
+        asset.data.root_link_lin_vel_b[:, 1],
+        asset.data.root_link_ang_vel_b[:, 2],
+        command[:, 1],
+        command[:, 2],
+        lateral_weight=lateral_weight,
+    )
+def feet_air_time_forward(
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+    threshold_min: float = 0.05,
+    threshold_max: float = 0.5,
+    command_name: str = "twist",
+    command_threshold: float = 0.1,
+) -> torch.Tensor:
+    """Return feet-air-time reward gated by actual forward sprint progress.
+
+    Plain air-time rewards can be farmed by stepping high in place.  This gate
+    pays proportionally to ``clamp(vx_actual / vx_commanded, 0, 1)`` and only
+    for positive forward commands above ``command_threshold``.
+    """
+    from mjlab.sensor import ContactSensor
+
+    sensor: ContactSensor = env.scene[sensor_name]
+    current_air_time = sensor.data.current_air_time
+    assert current_air_time is not None
+    in_range = (current_air_time > threshold_min) & (current_air_time < threshold_max)
+    reward = torch.sum(in_range.float(), dim=1)
+
+    in_air = current_air_time > 0
+    num_in_air = torch.sum(in_air.float())
+    mean_air_time = torch.sum(current_air_time * in_air.float()) / torch.clamp(
+        num_in_air, min=1
+    )
+    env.extras["log"]["Metrics/air_time_mean"] = mean_air_time
+
+    command = env.command_manager.get_command(command_name)
+    cmd_vx = command[:, 0]
+    vx = env.scene["robot"].data.root_link_lin_vel_b[:, 0]
+    progress = torch.clamp(vx / torch.clamp(cmd_vx, min=1e-3), 0.0, 1.0)
+    env.extras["log"]["Metrics/air_time_forward_progress"] = progress.mean()
+    scale = (cmd_vx > command_threshold).float()
+    return reward * progress * scale
+
+
+def air_time_window_curriculum(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    reward_name: str,
+    window_stages: list[dict],
+) -> torch.Tensor:
+    """Move a feet-air-time reward window through a sequence of stages."""
+    del env_ids
+
+    reward_term_cfg = env.reward_manager.get_term_cfg(reward_name)
+    current_min = window_stages[0]["threshold_min"]
+    current_max = window_stages[0]["threshold_max"]
+    for stage in window_stages:
+        if env.common_step_counter > stage["step"]:
+            current_min = stage["threshold_min"]
+            current_max = stage["threshold_max"]
+
+    reward_term_cfg.params["threshold_min"] = current_min
+    reward_term_cfg.params["threshold_max"] = current_max
+    return torch.tensor([current_min])
+def forward_speed_command_ranges_curriculum(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    command_name: str,
+    speed_stages: list[dict],
+) -> torch.Tensor:
+    """Schedule a straight-ahead command range without mutating ``env.cfg``.
+
+    The standard velocity curriculum is symmetric around zero and therefore
+    spreads late-stage samples over walking backwards, sideways, and turning.
+    A sprint task needs its data budget on a positive forward speed instead.
+    Each stage supplies ``min_speed`` and ``max_speed`` in m/s; lateral and yaw
+    commands stay exactly zero.
+    """
+    del env_ids  # Curriculum API requires this argument.
+
+    command_term = env.command_manager.get_term(command_name)
+    assert command_term is not None, f"Command term '{command_name}' not found"
+
+    current = speed_stages[0]
+    for stage in speed_stages:
+        if env.common_step_counter > stage["step"]:
+            current = stage
+
+    cfg = command_term.cfg
+    cfg.ranges.lin_vel_x = (current["min_speed"], current["max_speed"])
+    cfg.ranges.lin_vel_y = (0.0, 0.0)
+    cfg.ranges.ang_vel_z = (0.0, 0.0)
+    return torch.tensor([current["max_speed"]])
+
+
+def running_command_ranges_curriculum(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    command_name: str,
+    speed_stages: list[dict],
+) -> torch.Tensor:
+    """Advance a forward-only running speed band over training."""
+    del env_ids
+
+    from typing import cast
+
+    from mjlab.tasks.velocity.mdp import UniformVelocityCommandCfg
+
+    command_term = env.command_manager.get_term(command_name)
+    assert command_term is not None, f"Command term '{command_name}' not found"
+    cfg = cast(UniformVelocityCommandCfg, command_term.cfg)
+
+    current_min = float(speed_stages[0]["min_speed"])
+    current_max = float(speed_stages[0]["max_speed"])
+    for stage in speed_stages:
+        if env.common_step_counter >= stage["step"]:
+            current_min = float(stage["min_speed"])
+            current_max = float(stage["max_speed"])
+    if not (0.0 <= current_min <= current_max):
+        raise ValueError(f"invalid running speed band: {(current_min, current_max)}")
+
+    cfg.ranges.lin_vel_x = (current_min, current_max)
+    return torch.tensor([current_max], device=env.device)
+
+
+def turning_sprint_command_ranges_curriculum(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    command_name: str,
+    speed_stages: list[dict],
+) -> torch.Tensor:
+    """Schedule positive forward speed and bounded yaw for a sprint policy.
+
+    ``forward_speed_command_ranges_curriculum`` deliberately zeroes yaw for a
+    straight-line sprint. A turning sprint needs the same positive-speed
+    curriculum, but must retain a conservative yaw envelope at every stage.
+    Each stage supplies ``min_speed``, ``max_speed``, and ``max_yaw``.
+    """
+    del env_ids
+
+    command_term = env.command_manager.get_term(command_name)
+    assert command_term is not None, f"Command term '{command_name}' not found"
+
+    current = speed_stages[0]
+    for stage in speed_stages:
+        if env.common_step_counter > stage["step"]:
+            current = stage
+
+    cfg = command_term.cfg
+    cfg.ranges.lin_vel_x = (current["min_speed"], current["max_speed"])
+    cfg.ranges.lin_vel_y = (0.0, 0.0)
+    cfg.ranges.ang_vel_z = (-current["max_yaw"], current["max_yaw"])
+    return torch.tensor([current["max_speed"]])
+
+
+def projected_gravity(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Projected gravity vector in body frame.
+
+    Returns the gravity vector projected into the robot's body frame,
+    representing pure orientation without linear acceleration.
+    This is simpler than raw accelerometer and only depends on orientation.
+
+    Returns:
+        torch.Tensor: Projected gravity in body frame (num_envs, 3)
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    return asset.data.projected_gravity_b
+def slew_forward_velocity_command(
+    current: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    dt: float,
+    acceleration_m_s2: float,
+    deceleration_m_s2: float,
+) -> torch.Tensor:
+    """Advance a forward-speed command without an instantaneous velocity jump."""
+    if dt <= 0.0:
+        raise ValueError("dt must be positive")
+    if acceleration_m_s2 <= 0.0 or deceleration_m_s2 <= 0.0:
+        raise ValueError("acceleration and deceleration limits must be positive")
+    delta = target - current
+    max_delta = torch.where(
+        delta >= 0.0,
+        torch.full_like(delta, acceleration_m_s2 * dt),
+        torch.full_like(delta, deceleration_m_s2 * dt),
+    )
+    return current + torch.clamp(delta, min=-max_delta, max=max_delta)
+
+
+class SlewedForwardVelocityCommand(VelocityCommandCommandOnly):
+    """Forward-only velocity command with bounded acceleration and braking.
+
+    A fraction of re-sampled targets deliberately drops to a safe low-speed
+    band.  Keeping that transition in the same command term makes braking a
+    learned closed-loop behaviour instead of an untested inference-time edge
+    case.
+    """
+
+    cfg: "SlewedForwardVelocityCommandCfg"
+
+    def __init__(self, cfg: "SlewedForwardVelocityCommandCfg", env: ManagerBasedRlEnv):
+        super().__init__(cfg, env)
+        self.target_vel_command_b = torch.zeros_like(self.vel_command_b)
+        self._resetting = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+
+    def reset(self, env_ids: torch.Tensor | slice | None) -> dict[str, float]:
+        assert isinstance(env_ids, torch.Tensor)
+        self._resetting[env_ids] = True
+        try:
+            return super().reset(env_ids)
+        finally:
+            self._resetting[env_ids] = False
+
+    def _resample_command(self, env_ids: torch.Tensor) -> None:
+        previous = self.vel_command_b[env_ids].clone()
+        super()._resample_command(env_ids)
+        self.target_vel_command_b[env_ids] = self.vel_command_b[env_ids]
+        if self.cfg.slowdown_probability > 0.0:
+            slow_mask = (
+                torch.rand(len(env_ids), device=self.device)
+                < self.cfg.slowdown_probability
+            )
+            slow_ids = env_ids[slow_mask]
+            if len(slow_ids) > 0:
+                self.target_vel_command_b[slow_ids, 0].uniform_(
+                    *self.cfg.slowdown_speed_range
+                )
+                self.target_vel_command_b[slow_ids, 1:] = 0.0
+        reset_ids = self._resetting[env_ids]
+        self.vel_command_b[env_ids] = torch.where(
+            reset_ids.unsqueeze(-1), torch.zeros_like(previous), previous
+        )
+
+    def _update_command(self) -> None:
+        self.vel_command_b[:, 0] = slew_forward_velocity_command(
+            self.vel_command_b[:, 0],
+            self.target_vel_command_b[:, 0],
+            dt=self._env.step_dt,
+            acceleration_m_s2=self.cfg.forward_acceleration_m_s2,
+            deceleration_m_s2=self.cfg.forward_deceleration_m_s2,
+        )
+        super()._update_command()
+
+
+@_dataclass(kw_only=True)
+class SlewedForwardVelocityCommandCfg(VelocityCommandCommandOnlyCfg):
+    """Configuration for a physical, rate-bounded forward command."""
+
+    forward_acceleration_m_s2: float = 0.60
+    forward_deceleration_m_s2: float = 0.90
+    slowdown_probability: float = 0.0
+    slowdown_speed_range: tuple[float, float] = (0.25, 0.45)
+
+    def build(self, env: ManagerBasedRlEnv) -> "SlewedForwardVelocityCommand":
+        if not 0.0 <= self.slowdown_probability <= 1.0:
+            raise ValueError("slowdown_probability must be in [0, 1]")
+        low, high = self.slowdown_speed_range
+        if low < 0.0 or high < low:
+            raise ValueError("slowdown_speed_range must be non-negative and ordered")
+        return SlewedForwardVelocityCommand(self, env)
+
+
+def slew_twist_velocity_command(
+    current: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    dt: float,
+    acceleration: float,
+    deceleration: float,
+) -> torch.Tensor:
+    """Rate-limit a signed velocity command without instant direction flips."""
+    if dt <= 0.0:
+        raise ValueError("dt must be positive")
+    if acceleration <= 0.0 or deceleration <= 0.0:
+        raise ValueError("acceleration and deceleration limits must be positive")
+
+    same_direction = current * target >= 0.0
+    growing_magnitude = target.abs() >= current.abs()
+    accelerating = same_direction & growing_magnitude
+    max_delta = torch.where(
+        accelerating,
+        torch.full_like(current, acceleration * dt),
+        torch.full_like(current, deceleration * dt),
+    )
+    return current + torch.clamp(target - current, min=-max_delta, max=max_delta)
+
+
+class SlewedTurningVelocityCommand(VelocityCommandCommandOnly):
+    """Positive forward command with rate-bounded yaw and safe high-speed turns.
+
+    The target yaw range is tightened as forward speed approaches the current
+    stage ceiling. This leaves useful low-speed and turn-in-place authority
+    while avoiding a sharp, unqualified high-speed turn distribution.
+    """
+
+    cfg: "SlewedTurningVelocityCommandCfg"
+
+    def __init__(self, cfg: "SlewedTurningVelocityCommandCfg", env: ManagerBasedRlEnv):
+        super().__init__(cfg, env)
+        self.target_vel_command_b = torch.zeros_like(self.vel_command_b)
+        self._resetting = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+
+    def reset(self, env_ids: torch.Tensor | slice | None) -> dict[str, float]:
+        assert isinstance(env_ids, torch.Tensor)
+        self._resetting[env_ids] = True
+        try:
+            return super().reset(env_ids)
+        finally:
+            self._resetting[env_ids] = False
+
+    def _resample_command(self, env_ids: torch.Tensor) -> None:
+        previous = self.vel_command_b[env_ids].clone()
+        super()._resample_command(env_ids)
+        target = self.vel_command_b[env_ids]
+
+        if self.cfg.slowdown_probability > 0.0:
+            slow_mask = (
+                torch.rand(len(env_ids), device=self.device)
+                < self.cfg.slowdown_probability
+            )
+            slow_local_ids = slow_mask.nonzero().flatten()
+            if len(slow_local_ids) > 0:
+                target[slow_local_ids, 0].uniform_(*self.cfg.slowdown_speed_range)
+                target[slow_local_ids, 1] = 0.0
+
+        min_speed, max_speed = self.cfg.ranges.lin_vel_x
+        span = max(max_speed - min_speed, 1.0e-6)
+        speed_fraction = ((target[:, 0].abs() - min_speed) / span).clamp(0.0, 1.0)
+        yaw_scale = 1.0 - (1.0 - self.cfg.high_speed_yaw_fraction) * speed_fraction
+        target[:, 2] *= yaw_scale
+        self.target_vel_command_b[env_ids] = target
+
+        reset_ids = self._resetting[env_ids]
+        self.vel_command_b[env_ids] = torch.where(
+            reset_ids.unsqueeze(-1), torch.zeros_like(previous), previous
+        )
+
+    def _update_command(self) -> None:
+        self.vel_command_b[:, 0] = slew_forward_velocity_command(
+            self.vel_command_b[:, 0],
+            self.target_vel_command_b[:, 0],
+            dt=self._env.step_dt,
+            acceleration_m_s2=self.cfg.forward_acceleration_m_s2,
+            deceleration_m_s2=self.cfg.forward_deceleration_m_s2,
+        )
+        self.vel_command_b[:, 1] = self.target_vel_command_b[:, 1]
+        self.vel_command_b[:, 2] = slew_twist_velocity_command(
+            self.vel_command_b[:, 2],
+            self.target_vel_command_b[:, 2],
+            dt=self._env.step_dt,
+            acceleration=self.cfg.yaw_acceleration_rad_s2,
+            deceleration=self.cfg.yaw_deceleration_rad_s2,
+        )
+        super()._update_command()
+
+
+@_dataclass(kw_only=True)
+class SlewedTurningVelocityCommandCfg(SlewedForwardVelocityCommandCfg):
+    """Configuration for a forward sprint that can safely track yaw commands."""
+
+    yaw_acceleration_rad_s2: float = 1.60
+    yaw_deceleration_rad_s2: float = 2.40
+    high_speed_yaw_fraction: float = 0.65
+
+    def build(self, env: ManagerBasedRlEnv) -> "SlewedTurningVelocityCommand":
+        if not 0.0 <= self.slowdown_probability <= 1.0:
+            raise ValueError("slowdown_probability must be in [0, 1]")
+        low, high = self.slowdown_speed_range
+        if low < 0.0 or high < low:
+            raise ValueError("slowdown_speed_range must be non-negative and ordered")
+        if self.yaw_acceleration_rad_s2 <= 0.0 or self.yaw_deceleration_rad_s2 <= 0.0:
+            raise ValueError(
+                "yaw acceleration and deceleration limits must be positive"
+            )
+        if not 0.0 < self.high_speed_yaw_fraction <= 1.0:
+            raise ValueError("high_speed_yaw_fraction must be in (0, 1]")
+        return SlewedTurningVelocityCommand(self, env)
+class SpawnHeadingVelocityCommand(RelativeHeadingVelocityCommand):
+    """Expose error from the episode's spawn heading in command slot 2."""
+
+    def __init__(self, cfg, env: ManagerBasedRlEnv):
+        super().__init__(cfg, env)
+        self._heading_max = cfg.heading_error_clip
+
+    def _resample_command(self, env_ids: torch.Tensor) -> None:
+        super()._resample_command(env_ids)
+        self._target_heading_w[env_ids] = self.robot.data.heading_w[env_ids]
+        self.vel_command_b[env_ids, 2] = 0.0
+
+
+@_dataclass(kw_only=True)
+class SpawnHeadingVelocityCommandCfg(VelocityCommandCommandOnlyCfg):
+    heading_error_clip: float = 1.0
+
+    def build(self, env: ManagerBasedRlEnv) -> "SpawnHeadingVelocityCommand":
+        return SpawnHeadingVelocityCommand(self, env)
+_HEAD_CAMERA_CFG = SceneEntityCfg("robot", site_names=("head_camera",))
+
+
+def _site_forward_and_up_axes(
+    asset: Entity, asset_cfg: SceneEntityCfg
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the selected site's local +X (view) and +Z (up) axes in world frame."""
+    q = asset.data.site_quat_w[:, asset_cfg.site_ids[0], :]  # [w, x, y, z]
+    w, x, y, z = q.unbind(dim=-1)
+
+    # First and third columns of the quaternion rotation matrix.  The Microduck
+    # head_camera MJCF site uses +X as optical forward and +Z as camera-up.
+    forward = torch.stack(
+        (
+            1.0 - 2.0 * (y.square() + z.square()),
+            2.0 * (x * y + w * z),
+            2.0 * (x * z - w * y),
+        ),
+        dim=-1,
+    )
+    up = torch.stack(
+        (
+            2.0 * (x * z + w * y),
+            2.0 * (y * z - w * x),
+            1.0 - 2.0 * (x.square() + y.square()),
+        ),
+        dim=-1,
+    )
+    return forward, up
+
+
+def head_camera_level_forward_reward(
+    env: ManagerBasedRlEnv,
+    forward_std: float = 0.35,
+    up_std: float = 0.35,
+    asset_cfg: SceneEntityCfg = _HEAD_CAMERA_CFG,
+) -> torch.Tensor:
+    """Reward a level, forward-looking camera while allowing neck compensation.
+
+    ``forward`` follows the robot's *yaw-only* heading, while ``up`` is world
+    vertical.  Consequently, body pitch and roll must be actively cancelled by
+    the neck/head joints, but normal straight-line yaw is not mistaken for a
+    visual disturbance.  This is the usable approximation of chicken-head
+    stabilization for an IMU-only policy: it demands a stable horizon without
+    asking the policy to observe an unobservable global yaw reference.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    camera_forward, camera_up = _site_forward_and_up_axes(asset, asset_cfg)
+
+    # Build the robot's horizontal forward direction from the root +X axis.
+    # Normalising the xy projection deliberately removes pitch and roll.
+    q = asset.data.root_link_quat_w
+    w, x, y, z = q.unbind(dim=-1)
+    base_forward_xy = torch.stack(
+        (
+            1.0 - 2.0 * (y.square() + z.square()),
+            2.0 * (x * y + w * z),
+        ),
+        dim=-1,
+    )
+    base_forward_xy = torch.nn.functional.normalize(base_forward_xy, dim=-1, eps=1e-6)
+    desired_forward = torch.cat(
+        (base_forward_xy, torch.zeros_like(base_forward_xy[:, :1])), dim=-1
+    )
+    desired_up = torch.zeros_like(camera_up)
+    desired_up[:, 2] = 1.0
+
+    forward_error_sq = (camera_forward - desired_forward).square().sum(dim=-1)
+    up_error_sq = (camera_up - desired_up).square().sum(dim=-1)
+    return torch.exp(-forward_error_sq / (forward_std**2) - up_error_sq / (up_std**2))
+
+
+def head_camera_world_angular_rate_l2(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _HEAD_CAMERA_CFG,
+) -> torch.Tensor:
+    """Squared world-frame angular-rate proxy for the optical frame.
+
+    Penalising neck-joint velocity would suppress the very counter-motion that
+    stabilises the view.  This term instead differentiates the camera's world
+    forward and up axes, so it prices visible jitter while leaving smooth,
+    purposeful neck compensation available to the policy.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    forward, up = _site_forward_and_up_axes(asset, asset_cfg)
+    current = torch.cat((forward, up), dim=-1)
+
+    if (
+        not hasattr(env, "_head_camera_axes_prev")
+        or env._head_camera_axes_prev.shape != current.shape
+    ):
+        env._head_camera_axes_prev = current.detach().clone()
+
+    previous = env._head_camera_axes_prev
+    fresh = env.episode_length_buf <= 1
+    previous[fresh] = current[fresh]
+    rate = (current - previous) / max(float(env.step_dt), 1e-6)
+    env._head_camera_axes_prev = current.detach().clone()
+    return 0.5 * (rate[:, :3].square().sum(dim=-1) + rate[:, 3:].square().sum(dim=-1))

@@ -34,7 +34,8 @@ cd microduck_rl
 # train the walking policy (uses your GPU; ~1-2 h for a usable gait at 4096 envs)
 uv run train Mjlab-Velocity-Flat-MicroDuck --env.scene.num-envs 4096
 
-# smoke-test, then train dance from a random initialization
+# DuckEMW tasks: always smoke-test before a full run
+uv run train Mjlab-Sprint-Flat-MicroDuck --env.scene.num-envs 64 --agent.max-iterations 5
 uv run train Mjlab-Dance-Flat-MicroDuck --env.scene.num-envs 64 --agent.max-iterations 5
 uv run train Mjlab-Dance-Flat-MicroDuck --env.scene.num-envs 4096 --agent.max-iterations 4000
 
@@ -75,6 +76,10 @@ instead of locally (see [scripts/hf/README.md](scripts/hf/README.md)).
 | `Mjlab-GroundPick-{Flat,Rough}-MicroDuck` | flat/rough | Crouch and touch the ground with the mouth tip, return to stand |
 | `Mjlab-BallKick-Flat-MicroDuck` | flat | Kick a 70 mm / 15 g ball forward (actor is ball-blind) |
 | `Mjlab-Roulade-Flat-MicroDuck` | flat | Forward roll over the head, land back on the feet |
+| `Mjlab-Sprint-Flat-MicroDuck` | flat | DuckEMW running curriculum with a world-stabilized, forward-looking head |
+| `Mjlab-RunningStableHead-Flat-MicroDuck` | flat | Explicit name for the canonical fixed-gaze sprint task |
+| `Mjlab-Running-Flat-MicroDuck` | flat | DuckEMW-compatible running recipe without the head constraint |
+| `Mjlab-SprintV4-Flat-MicroDuck` | flat | Earlier DuckEMW sprint retained for comparisons |
 | `Mjlab-Dance-Flat-MicroDuck` | flat | Beat-conditioned in-place dance: squat, weight shift, head bob, climax, and call-out |
 | `Mjlab-Velocity-Flat-MicroDuck-Rollers` | flat | Roller-skate velocity tracking (passive wheels under the feet) |
 | `Mjlab-Velocity-Swizzle-MicroDuck` | flat | Classic symmetric swizzle skating |
@@ -107,90 +112,23 @@ uv run scripts/infer_policy.py --walking walk.onnx --standing stand.onnx \
 Keyboard-driven (velocity commands, `G` ground pick, `Y` sit/stand, `R` roulade,
 `K`/`L` kicks); `--debug`, `--save-csv`, `--record` support sim2real comparisons.
 
-### MimicKit double spin-kick
+### DuckEMW sprint
 
-`Mjlab-Spinkick-Official-BeyondMimic-MicroDuck` is a direct Microduck adapter
-around MJLab's stock BeyondMimic tracking task and G1 PPO recipe. It uses all 14 actuated
-joints and ten bodies across both legs, trunk, neck, and head. Metre-based
-reward widths and reset noise are normalized by the measured UMR
-character-to-Microduck height ratio; angular terms and PPO remain unchanged.
-Training first uses MJLab's broad 0.25 m exploration guard, then narrows to an
-intermediate 0.15 m physical guard.  Final acceptance is morphology-tolerant:
-per-frame retarget errors are diagnostic, while the hard requirements are a
-complete physically valid rollout, correct spin direction with substantial
-rotation coverage, a distinct single-leg kick, broad full-body similarity,
-and a settled standing finish. Training keeps the official adaptive
-`MotionCommand` resampling and 10 second episode lifecycle. Playback is finite:
-after the final standing frame it is held indefinitely instead of looping back
-into the kick.
-
-For high-dynamic clips that collapse to a stationary policy, the registered
-`Mjlab-Spinkick-Dense-Start-MicroDuck` stage keeps the same joint-position
-action space, PPO, compound BAM physics, and nine BeyondMimic rewards, while
-adding two bounded non-saturating full-body tracking scores. They use the
-complete three-axis angular velocity and averages over every tracked body and
-actuated joint; they do not encode a motion phase, preferred rotation axis,
-kick leg, keyframe, or target amplitude. Its rollouts start at frame zero so a
-finite deployment sequence is learned end-to-end instead of being hidden by
-adaptive-RSI performance on later phases.
-
-The converter accepts an official UMR result directly. It repeats the original
-60 Hz action at 1.0x to 2.65 seconds, adds the same 0.5 second entry/exit
-transitions and 1.0 second standing tail as `g1_spinkick_example`, resamples to
-50 Hz, and applies a final hard joint velocity/acceleration/jerk audit. A
-robot-level 2.5 mm root-Z calibration removes the sole-mesh floor penetration
-without changing the jump excursion, velocity, timing, or pose. The source's
-aerial root trajectory is otherwise preserved. For severe morphology changes,
-the UMR solve also uses a robot-agnostic source-root orientation prior. This
-prevents the free root from rotating the entire target robot sideways merely to
-reduce surface-correspondence error; it does not add a Spin-specific pose or RL
-reward.
+`Mjlab-Sprint-Flat-MicroDuck` uses a forward-progress curriculum with head-camera horizon and angular-rate constraints. Train from random initialization; do not add resume or checkpoint-loading flags.
 
 ```bash
-uv run convert-umr-motion \
-    --input artifacts/retarget/mimickit_spinkick_umr60/umr_result.npz \
-    --output artifacts/motions/mimickit_spinkick_microduck_umr60_g1pad/motion.npz \
-    --duration 2.65 --transition-duration 0.5 --hold-duration 1.0 \
-    --output-fps 50
+MICRODUCK_RUNNING_TARGET_MAX_SPEED=2.5 \
+MICRODUCK_RUNNING_SPEED_CAP=2.6 \
+MICRODUCK_RUNNING_HIGH_SPEED_STAGE_INTERVAL=750 \
+MICRODUCK_RUNNING_FORWARD_PROGRESS_WEIGHT=5.0 \
+MICRODUCK_RUNNING_ACTION_RATE_WEIGHT=-0.10 \
+MICRODUCK_RUNNING_CURRICULUM_DIVISOR=8 \
+uv run train Mjlab-Sprint-Flat-MicroDuck --env.scene.num-envs 4096 \
+    --agent.max-iterations 1700
 
-MUJOCO_GL=egl uv run python scripts/render_spinkick_reference.py \
-    --motion artifacts/motions/mimickit_spinkick_microduck_umr60_g1pad/motion.npz \
-    --output artifacts/videos/mimickit_spinkick_reference.mp4
-
-uv run train Mjlab-Spinkick-Official-BeyondMimic-MicroDuck \
-    --env.commands.motion.motion-file \
-      artifacts/motions/mimickit_spinkick_microduck_umr60_g1pad/motion.npz \
-    --env.scene.num-envs 4096 --agent.max-iterations 20000
-
-# Optional PPO continuation curriculum for preserving a moving initialization.
-# This is NOT part of UMR: UMR never changes gravity. A checkpoint produced by
-# this task is intermediate-only and cannot be used for final evaluation or a
-# deliverable video. Resume it in the Earth-gravity task above; final training,
-# evaluation, and video acceptance must all use gravity=9.81 m/s^2.
-uv run train Mjlab-Spinkick-Official-ScaledGravity-MicroDuck \
-    --env.commands.motion.motion-file \
-      artifacts/motions/mimickit_spinkick_microduck_umr60_g1pad/motion.npz \
-    --env.scene.num-envs 4096 --agent.max-iterations 20000
-
-MUJOCO_GL=egl uv run evaluate-spinkick \
-    --checkpoint-file <model.pt> \
-    --motion-file artifacts/motions/mimickit_spinkick_microduck_umr60_g1pad/motion.npz \
-    --output-file artifacts/evaluations/spinkick.json \
-    --video-file artifacts/evaluations/spinkick.mp4
-
-# For a comparison video's physical-result panel, hide the reference ghost.
-MUJOCO_GL=egl uv run evaluate-spinkick \
-    --checkpoint-file <earth-gravity-model.pt> \
-    --task-id Mjlab-Spinkick-Dense-Start-MicroDuck \
-    --no-show-reference \
-    --video-file artifacts/evaluations/spinkick_earth_physics_only.mp4
-
-# Diagnostic only: keep simulating after a fall to expose the real remaining
-# trajectory.  This mode is deliberately prevented from passing acceptance.
-MUJOCO_GL=egl uv run evaluate-spinkick \
-    --checkpoint-file <model.pt> \
-    --task-id Mjlab-Spinkick-Residual-Nominal-Guided-MicroDuck \
-    --diagnostic-no-early-termination
+uv run python scripts/evaluate_running_checkpoint.py \
+    --checkpoint-file <model.pt> --task-id Mjlab-Sprint-Flat-MicroDuck \
+    --speed 2.2 --num-envs 512 --duration-s 10
 ```
 
 ### Backlash variants
@@ -297,4 +235,5 @@ joint-index mappings, reward sign conventions, and NaN guards.
 This project is licensed under the Apache 2.0 License. See the [LICENSE](LICENSE) file for details.
 3D model files are licensed under Creative Commons BY-SA-NC.
 
-The beat-conditioned dance task is adapted from [DuckEMW](https://github.com/emwstudio/DuckEMW); source provenance is recorded in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+The sprint and beat-conditioned dance tasks are adapted from [DuckEMW](https://github.com/emwstudio/DuckEMW).
+Source provenance and licensing are recorded in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
