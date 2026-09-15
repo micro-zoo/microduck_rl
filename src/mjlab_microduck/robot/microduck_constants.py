@@ -120,7 +120,14 @@ FULL_COLLISION = CollisionCfg(
 _BAM_ACTUATOR_KWARGS = dict(
     motor_name="xl330",
     model="m6",
-    target_names_expr=(r"^(?!passive_).*",),
+    # Enumerate the 14 servo joints.  The previous catch-all regex also
+    # matched seven sites (IMU, feet, camera, mouth), which was harmless to the
+    # joint transmission but obscured action-space validation with a warning.
+    target_names_expr=(
+        r"^(left_hip_yaw|left_hip_roll|left_hip_pitch|left_knee|left_ankle|"
+        r"neck_pitch|head_pitch|head_yaw|head_roll|right_hip_yaw|"
+        r"right_hip_roll|right_hip_pitch|right_knee|right_ankle)$",
+    ),
     kp_fw=200.0,  # microduck's preserved firmware stiffness (microban uses 125)
     # vin_range=(6.9, 7.9),
     vin_range=(6.5, 8.2),

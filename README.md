@@ -107,6 +107,92 @@ uv run scripts/infer_policy.py --walking walk.onnx --standing stand.onnx \
 Keyboard-driven (velocity commands, `G` ground pick, `Y` sit/stand, `R` roulade,
 `K`/`L` kicks); `--debug`, `--save-csv`, `--record` support sim2real comparisons.
 
+### MimicKit double spin-kick
+
+`Mjlab-Spinkick-Official-BeyondMimic-MicroDuck` is a direct Microduck adapter
+around MJLab's stock BeyondMimic tracking task and G1 PPO recipe. It uses all 14 actuated
+joints and ten bodies across both legs, trunk, neck, and head. Metre-based
+reward widths and reset noise are normalized by the measured UMR
+character-to-Microduck height ratio; angular terms and PPO remain unchanged.
+Training first uses MJLab's broad 0.25 m exploration guard, then narrows to an
+intermediate 0.15 m physical guard.  Final acceptance is morphology-tolerant:
+per-frame retarget errors are diagnostic, while the hard requirements are a
+complete physically valid rollout, correct spin direction with substantial
+rotation coverage, a distinct single-leg kick, broad full-body similarity,
+and a settled standing finish. Training keeps the official adaptive
+`MotionCommand` resampling and 10 second episode lifecycle. Playback is finite:
+after the final standing frame it is held indefinitely instead of looping back
+into the kick.
+
+For high-dynamic clips that collapse to a stationary policy, the registered
+`Mjlab-Spinkick-Dense-Start-MicroDuck` stage keeps the same joint-position
+action space, PPO, compound BAM physics, and nine BeyondMimic rewards, while
+adding two bounded non-saturating full-body tracking scores. They use the
+complete three-axis angular velocity and averages over every tracked body and
+actuated joint; they do not encode a motion phase, preferred rotation axis,
+kick leg, keyframe, or target amplitude. Its rollouts start at frame zero so a
+finite deployment sequence is learned end-to-end instead of being hidden by
+adaptive-RSI performance on later phases.
+
+The converter accepts an official UMR result directly. It repeats the original
+60 Hz action at 1.0x to 2.65 seconds, adds the same 0.5 second entry/exit
+transitions and 1.0 second standing tail as `g1_spinkick_example`, resamples to
+50 Hz, and applies a final hard joint velocity/acceleration/jerk audit. A
+robot-level 2.5 mm root-Z calibration removes the sole-mesh floor penetration
+without changing the jump excursion, velocity, timing, or pose. The source's
+aerial root trajectory is otherwise preserved. For severe morphology changes,
+the UMR solve also uses a robot-agnostic source-root orientation prior. This
+prevents the free root from rotating the entire target robot sideways merely to
+reduce surface-correspondence error; it does not add a Spin-specific pose or RL
+reward.
+
+```bash
+uv run convert-umr-motion \
+    --input artifacts/retarget/mimickit_spinkick_umr60/umr_result.npz \
+    --output artifacts/motions/mimickit_spinkick_microduck_umr60_g1pad/motion.npz \
+    --duration 2.65 --transition-duration 0.5 --hold-duration 1.0 \
+    --output-fps 50
+
+MUJOCO_GL=egl uv run python scripts/render_spinkick_reference.py \
+    --motion artifacts/motions/mimickit_spinkick_microduck_umr60_g1pad/motion.npz \
+    --output artifacts/videos/mimickit_spinkick_reference.mp4
+
+uv run train Mjlab-Spinkick-Official-BeyondMimic-MicroDuck \
+    --env.commands.motion.motion-file \
+      artifacts/motions/mimickit_spinkick_microduck_umr60_g1pad/motion.npz \
+    --env.scene.num-envs 4096 --agent.max-iterations 20000
+
+# Optional PPO continuation curriculum for preserving a moving initialization.
+# This is NOT part of UMR: UMR never changes gravity. A checkpoint produced by
+# this task is intermediate-only and cannot be used for final evaluation or a
+# deliverable video. Resume it in the Earth-gravity task above; final training,
+# evaluation, and video acceptance must all use gravity=9.81 m/s^2.
+uv run train Mjlab-Spinkick-Official-ScaledGravity-MicroDuck \
+    --env.commands.motion.motion-file \
+      artifacts/motions/mimickit_spinkick_microduck_umr60_g1pad/motion.npz \
+    --env.scene.num-envs 4096 --agent.max-iterations 20000
+
+MUJOCO_GL=egl uv run evaluate-spinkick \
+    --checkpoint-file <model.pt> \
+    --motion-file artifacts/motions/mimickit_spinkick_microduck_umr60_g1pad/motion.npz \
+    --output-file artifacts/evaluations/spinkick.json \
+    --video-file artifacts/evaluations/spinkick.mp4
+
+# For a comparison video's physical-result panel, hide the reference ghost.
+MUJOCO_GL=egl uv run evaluate-spinkick \
+    --checkpoint-file <earth-gravity-model.pt> \
+    --task-id Mjlab-Spinkick-Dense-Start-MicroDuck \
+    --no-show-reference \
+    --video-file artifacts/evaluations/spinkick_earth_physics_only.mp4
+
+# Diagnostic only: keep simulating after a fall to expose the real remaining
+# trajectory.  This mode is deliberately prevented from passing acceptance.
+MUJOCO_GL=egl uv run evaluate-spinkick \
+    --checkpoint-file <model.pt> \
+    --task-id Mjlab-Spinkick-Residual-Nominal-Guided-MicroDuck \
+    --diagnostic-no-early-termination
+```
+
 ### Backlash variants
 
 Every main task has a **Backlash** twin that trains on a model with ±1° of gear
