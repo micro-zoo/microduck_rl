@@ -34,6 +34,10 @@ cd microduck_rl
 # train the walking policy (uses your GPU; ~1-2 h for a usable gait at 4096 envs)
 uv run train Mjlab-Velocity-Flat-MicroDuck --env.scene.num-envs 4096
 
+# smoke-test, then train dance from a random initialization
+uv run train Mjlab-Dance-Flat-MicroDuck --env.scene.num-envs 64 --agent.max-iterations 5
+uv run train Mjlab-Dance-Flat-MicroDuck --env.scene.num-envs 4096 --agent.max-iterations 4000
+
 # watch a trained policy in the viewer
 uv run play Mjlab-Velocity-Flat-MicroDuck --wandb-run-path <entity/project/run_id>
 
@@ -71,6 +75,7 @@ instead of locally (see [scripts/hf/README.md](scripts/hf/README.md)).
 | `Mjlab-GroundPick-{Flat,Rough}-MicroDuck` | flat/rough | Crouch and touch the ground with the mouth tip, return to stand |
 | `Mjlab-BallKick-Flat-MicroDuck` | flat | Kick a 70 mm / 15 g ball forward (actor is ball-blind) |
 | `Mjlab-Roulade-Flat-MicroDuck` | flat | Forward roll over the head, land back on the feet |
+| `Mjlab-Dance-Flat-MicroDuck` | flat | Beat-conditioned in-place dance: squat, weight shift, head bob, climax, and call-out |
 | `Mjlab-Velocity-Flat-MicroDuck-Rollers` | flat | Roller-skate velocity tracking (passive wheels under the feet) |
 | `Mjlab-Velocity-Swizzle-MicroDuck` | flat | Classic symmetric swizzle skating |
 | `Mjlab-RollerCrouch-Flat-MicroDuck` | flat | Crouch while gliding on rollers |
@@ -78,6 +83,18 @@ instead of locally (see [scripts/hf/README.md](scripts/hf/README.md)).
 | `Mjlab-RollerStandUp-Flat-MicroDuck` | flat | Stand up from the ground onto the wheels |
 | `Mjlab-Spin-Flat-MicroDuck` | flat | Fast spin in place on rollers |
 
+
+### Beat-conditioned dance
+
+The dance policy keeps the shared 61-dimensional actor contract and maps beat phase, tempo, and a three-bit move id into the existing six-dimensional body-command slot. Export and validate a checkpoint against a DuckEMW-compatible beat timeline:
+
+```bash
+uv run scripts/export.py Mjlab-Dance-Flat-MicroDuck --checkpoint-file <model.pt>
+uv run python scripts/dance_to_timeline.py --policy <dance.onnx> \
+    --timeline tests/fixtures/all_moves_120.timeline.json --save-csv dance.csv
+uv run python scripts/check_beat_align.py dance.csv \
+    --timeline tests/fixtures/all_moves_120.timeline.json
+```
 At deployment the runtime hot-swaps these policies (walk / recover / trick)
 behind a shared 61-dimensional observation contract, so any of them can take
 over the robot at any moment. `scripts/infer_policy.py` rehearses exactly that:
@@ -193,3 +210,5 @@ joint-index mappings, reward sign conventions, and NaN guards.
 
 This project is licensed under the Apache 2.0 License. See the [LICENSE](LICENSE) file for details.
 3D model files are licensed under Creative Commons BY-SA-NC.
+
+The beat-conditioned dance task is adapted from [DuckEMW](https://github.com/emwstudio/DuckEMW); source provenance is recorded in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

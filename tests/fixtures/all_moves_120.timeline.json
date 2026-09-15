@@ -1,0 +1,14 @@
+{
+  "name": "all_moves_120",
+  "bpm": 120.0,
+  "t0": 0.0,
+  "duration": 20.0,
+  "beat_times": [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0, 6.5, 7.0, 7.5, 8.0, 8.5, 9.0, 9.5, 10.0, 10.5, 11.0, 11.5, 12.0, 12.5, 13.0, 13.5, 14.0, 14.5, 15.0, 15.5, 16.0, 16.5, 17.0, 17.5, 18.0, 18.5, 19.0, 19.5, 20.0],
+  "segments": [
+    {"move": 0, "move_name": "squat_bounce", "start_beat": 0, "end_beat": 8, "t_start": 0.0, "t_end": 4.0},
+    {"move": 1, "move_name": "weight_shift", "start_beat": 8, "end_beat": 16, "t_start": 4.0, "t_end": 8.0},
+    {"move": 2, "move_name": "head_bob", "start_beat": 16, "end_beat": 24, "t_start": 8.0, "t_end": 12.0},
+    {"move": 3, "move_name": "climax", "start_beat": 24, "end_beat": 32, "t_start": 12.0, "t_end": 16.0},
+    {"move": 4, "move_name": "call_out", "start_beat": 32, "end_beat": 40, "t_start": 16.0, "t_end": 20.0}
+  ]
+}
