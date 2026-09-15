@@ -2,6 +2,8 @@ from mjlab.tasks.registry import register_mjlab_task
 from mjlab.tasks.tracking.rl import MotionTrackingOnPolicyRunner
 from mjlab.tasks.velocity.rl import VelocityOnPolicyRunner
 
+from .tracking_feedback_runner import TrackingFeedbackMotionTrackingOnPolicyRunner
+
 
 class MicroduckOnPolicyRunner(VelocityOnPolicyRunner):
     def __init__(self, env, train_cfg: dict, log_dir=None, device="cpu", **kwargs):
@@ -397,6 +399,85 @@ register_mjlab_task(
     ),
     rl_cfg=microduck_spinkick_mimic_runner_cfg(),
     runner_cls=MotionTrackingOnPolicyRunner,
+)
+
+# Generic high-fidelity continuation: every body and joint is tracked more
+# tightly, with no spin-, kick-, or clip-specific shaping.  Train the
+# deterministic Earth-physics stage first, then resume the same policy in the
+# robust task below.
+register_mjlab_task(
+    task_id="Mjlab-Spinkick-Dense-Fidelity-Nominal-MicroDuck",
+    env_cfg=make_microduck_spinkick_mimic_env_cfg(
+        start_training=True,
+        dense_tracking_guidance=True,
+        high_fidelity_guidance=True,
+        nominal_training=True,
+    ),
+    play_env_cfg=make_microduck_spinkick_mimic_env_cfg(
+        play=True,
+        dense_tracking_guidance=True,
+        high_fidelity_guidance=True,
+        nominal_training=True,
+    ),
+    rl_cfg=microduck_spinkick_mimic_runner_cfg(),
+    runner_cls=MotionTrackingOnPolicyRunner,
+)
+
+register_mjlab_task(
+    task_id="Mjlab-Spinkick-Dense-Fidelity-MicroDuck",
+    env_cfg=make_microduck_spinkick_mimic_env_cfg(
+        start_training=True,
+        dense_tracking_guidance=True,
+        high_fidelity_guidance=True,
+    ),
+    play_env_cfg=make_microduck_spinkick_mimic_env_cfg(
+        play=True,
+        dense_tracking_guidance=True,
+        high_fidelity_guidance=True,
+    ),
+    rl_cfg=microduck_spinkick_mimic_runner_cfg(),
+    runner_cls=MotionTrackingOnPolicyRunner,
+)
+
+# A closed-loop version of the generic high-fidelity task.  It adds only the
+# already-available root-position error and base linear velocity to the actor;
+# no motion-specific reward, limb, axis, or keyframe is introduced.
+register_mjlab_task(
+    task_id="Mjlab-Spinkick-Dense-Fidelity-Feedback-Nominal-MicroDuck",
+    env_cfg=make_microduck_spinkick_mimic_env_cfg(
+        start_training=True,
+        dense_tracking_guidance=True,
+        high_fidelity_guidance=True,
+        actor_tracking_feedback=True,
+        nominal_training=True,
+    ),
+    play_env_cfg=make_microduck_spinkick_mimic_env_cfg(
+        play=True,
+        dense_tracking_guidance=True,
+        high_fidelity_guidance=True,
+        actor_tracking_feedback=True,
+        nominal_training=True,
+    ),
+    rl_cfg=microduck_spinkick_mimic_runner_cfg(),
+    runner_cls=TrackingFeedbackMotionTrackingOnPolicyRunner,
+)
+
+register_mjlab_task(
+    task_id="Mjlab-Spinkick-Dense-Fidelity-Feedback-MicroDuck",
+    env_cfg=make_microduck_spinkick_mimic_env_cfg(
+        start_training=True,
+        dense_tracking_guidance=True,
+        high_fidelity_guidance=True,
+        actor_tracking_feedback=True,
+    ),
+    play_env_cfg=make_microduck_spinkick_mimic_env_cfg(
+        play=True,
+        dense_tracking_guidance=True,
+        high_fidelity_guidance=True,
+        actor_tracking_feedback=True,
+    ),
+    rl_cfg=microduck_spinkick_mimic_runner_cfg(),
+    runner_cls=TrackingFeedbackMotionTrackingOnPolicyRunner,
 )
 
 # Optional PPO continuation curriculum, not part of UMR.  UMR preserves time

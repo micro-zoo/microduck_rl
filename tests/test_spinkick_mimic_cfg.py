@@ -96,6 +96,14 @@ def test_spinkick_actor_matches_no_state_estimation_example():
     assert "joint_vel" in terms
 
 
+def test_spinkick_actor_tracking_feedback_is_opt_in():
+    cfg = make_microduck_spinkick_mimic_env_cfg(actor_tracking_feedback=True)
+    terms = cfg.observations["actor"].terms
+
+    assert "motion_anchor_pos_b" in terms
+    assert "base_lin_vel" in terms
+
+
 def test_official_spinkick_training_keeps_stock_command_lifecycle():
     cfg = make_microduck_spinkick_mimic_env_cfg(
         official_training_lifecycle=True
@@ -261,6 +269,34 @@ def test_spinkick_strict_curriculum_tightens_failure_distance():
     assert intermediate.terminations["ee_body_pos"].params["threshold"] == 0.15
 
 
+def test_high_fidelity_guidance_is_generic_and_stricter():
+    broad = make_microduck_spinkick_mimic_env_cfg(
+        start_training=True,
+        dense_tracking_guidance=True,
+    )
+    fidelity = make_microduck_spinkick_mimic_env_cfg(
+        start_training=True,
+        dense_tracking_guidance=True,
+        high_fidelity_guidance=True,
+        nominal_training=True,
+    )
+
+    assert fidelity.sim.mujoco.gravity == (0.0, 0.0, -9.81)
+    assert fidelity.commands["motion"].sampling_mode == "start"
+    assert fidelity.rewards["motion_anchor_ang_vel_dense"].weight > broad.rewards[
+        "motion_anchor_ang_vel_dense"
+    ].weight
+    assert fidelity.rewards["motion_full_body_tracking_dense"].weight > broad.rewards[
+        "motion_full_body_tracking_dense"
+    ].weight
+    assert fidelity.rewards["motion_full_body_tracking_dense"].params[
+        "position_scale"
+    ] < broad.rewards["motion_full_body_tracking_dense"].params["position_scale"]
+    assert fidelity.rewards["motion_full_body_tracking_dense"].params[
+        "joint_scale"
+    ] < broad.rewards["motion_full_body_tracking_dense"].params["joint_scale"]
+
+
 def test_spinkick_play_starts_at_reference_frame_zero():
     cfg = make_microduck_spinkick_mimic_env_cfg(play=True)
     motion = cfg.commands["motion"]
@@ -299,6 +335,14 @@ def test_spinkick_registration_uses_stock_motion_runner():
     )
     assert (
         load_runner_cls("Mjlab-Spinkick-Dense-Start-MicroDuck")
+        is MotionTrackingOnPolicyRunner
+    )
+    assert (
+        load_runner_cls("Mjlab-Spinkick-Dense-Fidelity-Nominal-MicroDuck")
+        is MotionTrackingOnPolicyRunner
+    )
+    assert (
+        load_runner_cls("Mjlab-Spinkick-Dense-Fidelity-MicroDuck")
         is MotionTrackingOnPolicyRunner
     )
     assert (

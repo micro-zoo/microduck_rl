@@ -332,6 +332,8 @@ def make_microduck_spinkick_mimic_env_cfg(
     strict_tracking: bool = False,
     start_training: bool = False,
     dense_tracking_guidance: bool = False,
+    high_fidelity_guidance: bool = False,
+    actor_tracking_feedback: bool = False,
     adaptive_start_probability: float = 0.0,
     tracking_termination_distance: float | None = None,
     terminate_protected_contact: bool = True,
@@ -463,24 +465,49 @@ def make_microduck_spinkick_mimic_env_cfg(
         "std"
     ] *= MICRODUCK_LINEAR_TRACKING_SCALE
     if dense_tracking_guidance:
-        cfg.rewards["motion_anchor_ang_vel_dense"] = RewardTermCfg(
-            func=motion_anchor_angular_velocity_tracking_dense,
-            weight=2.0,
-            params={
-                "command_name": "motion",
+        # A generic continuation for dynamic motions whose first successful
+        # policy has learned a stable but visibly reduced-amplitude version of
+        # the reference.  These terms remain averages over every tracked body
+        # and every actuator; there are no phase, limb, axis, or keyframe
+        # rewards.  The tighter, still non-saturating scales give PPO a usable
+        # gradient toward higher-fidelity motion rather than merely rewarding
+        # the first broadly stable traversal.
+        if high_fidelity_guidance:
+            angular_velocity_reward_weight = 3.0
+            angular_velocity_reward_scale = 6.0
+            full_body_reward_weight = 4.0
+            full_body_scales = {
+                "position_scale": 0.09,
+                "orientation_scale": 0.75,
+                "joint_scale": 0.45,
+                "linear_velocity_scale": 0.75,
                 "angular_velocity_scale": 8.0,
-            },
-        )
-        cfg.rewards["motion_full_body_tracking_dense"] = RewardTermCfg(
-            func=motion_full_body_tracking_dense,
-            weight=2.0,
-            params={
-                "command_name": "motion",
+            }
+        else:
+            angular_velocity_reward_weight = 2.0
+            angular_velocity_reward_scale = 8.0
+            full_body_reward_weight = 2.0
+            full_body_scales = {
                 "position_scale": 0.15,
                 "orientation_scale": 1.5,
                 "joint_scale": 0.75,
                 "linear_velocity_scale": 1.0,
                 "angular_velocity_scale": 12.0,
+            }
+        cfg.rewards["motion_anchor_ang_vel_dense"] = RewardTermCfg(
+            func=motion_anchor_angular_velocity_tracking_dense,
+            weight=angular_velocity_reward_weight,
+            params={
+                "command_name": "motion",
+                "angular_velocity_scale": angular_velocity_reward_scale,
+            },
+        )
+        cfg.rewards["motion_full_body_tracking_dense"] = RewardTermCfg(
+            func=motion_full_body_tracking_dense,
+            weight=full_body_reward_weight,
+            params={
+                "command_name": "motion",
+                **full_body_scales,
             },
         )
 
@@ -554,19 +581,20 @@ def make_microduck_spinkick_mimic_env_cfg(
     if not official_training_lifecycle:
         cfg.episode_length_s = 5.0
 
-    # Match g1_spinkick_example's no-state-estimation variant.  The critic
-    # keeps privileged state, while the actor does not receive global root
-    # position or base linear velocity.
-    actor_terms = {
-        name: term
-        for name, term in cfg.observations["actor"].terms.items()
-        if name not in {"motion_anchor_pos_b", "base_lin_vel"}
-    }
-    cfg.observations["actor"] = ObservationGroupCfg(
-        terms=actor_terms,
-        concatenate_terms=True,
-        enable_corruption=True,
-    )
+    if not actor_tracking_feedback:
+        # Match g1_spinkick_example's no-state-estimation variant.  The critic
+        # keeps privileged state, while the actor does not receive global root
+        # position or base linear velocity.
+        actor_terms = {
+            name: term
+            for name, term in cfg.observations["actor"].terms.items()
+            if name not in {"motion_anchor_pos_b", "base_lin_vel"}
+        }
+        cfg.observations["actor"] = ObservationGroupCfg(
+            terms=actor_terms,
+            concatenate_terms=True,
+            enable_corruption=True,
+        )
 
     if nominal_training:
         # Stage 1 curriculum: learn the dynamically corrected action under one
